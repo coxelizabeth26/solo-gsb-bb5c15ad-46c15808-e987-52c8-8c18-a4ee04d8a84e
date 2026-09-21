@@ -5,16 +5,18 @@ import os
 from contextlib import asynccontextmanager
 from datetime import timedelta
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
+from .db import RevisionConflict
 from .scheduler import (
     build_original, parse_dt, reschedule, suggest_postponements,
 )
 from .schemas import (
     ActualIn, BreakCreate, ItemCreate, MeetingCreate, MoveIn, PostponeIn,
+    RevisionIn,
 )
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -28,6 +30,20 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="会议议程实时重排", version="1.0.0", lifespan=lifespan)
+
+
+@app.exception_handler(RevisionConflict)
+def revision_conflict_handler(request: Request, exc: RevisionConflict) -> JSONResponse:
+    """Optimistic-lock failure: nothing was written; echo the latest revision."""
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": "计划已被其他操作更新（revision 不一致），请刷新计划后重试；"
+                      "若正在确认延期，请重新生成延期预览。",
+            "code": "revision_conflict",
+            "current_revision": exc.expected_revision,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +80,7 @@ def _build_plan(meeting: dict) -> dict:
         "items": items,
         "breaks": breaks,
         "live": live,
+        "revision": meeting["revision"],
         "anchor": current["anchor"],
         "undo_count": db.undo_count(meeting["id"]),
         "original": original,
@@ -76,6 +93,18 @@ def _get_meeting_or_404(meeting_id: int) -> dict:
     if meeting is None:
         raise HTTPException(404, "会议不存在")
     return meeting
+
+
+def _ensure_revision(meeting: dict, revision: int) -> None:
+    """Fast-fail pre-check for stale clients.
+
+    The authoritative compare-and-increment happens inside the write
+    transaction (``db._check_and_bump_revision``); this read-side check only
+    guarantees that a stale request is reported as a conflict instead of some
+    unrelated business error, so clients always know to refresh / re-preview.
+    """
+    if revision != meeting["revision"]:
+        raise RevisionConflict(meeting["revision"])
 
 
 def _is_live(meeting_id: int) -> bool:
@@ -199,6 +228,7 @@ def api_delete_break(break_id: int):
 @app.post("/api/meetings/{meeting_id}/actuals")
 def api_record_actual(meeting_id: int, body: ActualIn):
     meeting = _get_meeting_or_404(meeting_id)
+    _ensure_revision(meeting, body.revision)
     item = db.get_item(body.item_id)
     if item is None or item["meeting_id"] != meeting_id:
         raise HTTPException(404, "议程项不存在")
@@ -226,24 +256,25 @@ def api_record_actual(meeting_id: int, body: ActualIn):
         if actual < anchor:
             raise HTTPException(422, f"实际结束时间不能早于上一议程结束时间 {anchor.strftime('%H:%M')}")
 
-    db.record_actual(meeting_id, body.item_id, body.actual_end)
+    db.record_actual(meeting_id, body.item_id, body.actual_end, body.revision)
     return _build_plan(db.get_meeting(meeting_id))
 
 
 @app.post("/api/meetings/{meeting_id}/undo")
-def api_undo(meeting_id: int):
-    _get_meeting_or_404(meeting_id)
-    if not db.undo_last(meeting_id):
+def api_undo(meeting_id: int, body: RevisionIn):
+    _ensure_revision(_get_meeting_or_404(meeting_id), body.revision)
+    if not db.undo_last(meeting_id, body.revision):
         raise HTTPException(404, "没有可撤销的实况录入")
     return _build_plan(db.get_meeting(meeting_id))
 
 
 @app.post("/api/meetings/{meeting_id}/reset")
-def api_reset(meeting_id: int):
-    _get_meeting_or_404(meeting_id)
+def api_reset(meeting_id: int, body: RevisionIn):
+    meeting = _get_meeting_or_404(meeting_id)
+    _ensure_revision(meeting, body.revision)
     if not _is_live(meeting_id):
         raise HTTPException(409, "当前没有任何实况录入")
-    db.reset_actuals(meeting_id)
+    db.reset_actuals(meeting_id, body.revision)
     return _build_plan(db.get_meeting(meeting_id))
 
 
@@ -253,13 +284,20 @@ def api_reset(meeting_id: int):
 
 @app.post("/api/meetings/{meeting_id}/postponements/preview")
 def api_preview_postponements(meeting_id: int):
-    """Trial-schedule a postponement proposal; persists nothing."""
+    """Trial-schedule a postponement proposal; persists nothing.
+
+    The returned ``revision`` is the meeting's current version: it must be
+    echoed unchanged by the confirm call. If another live write lands in
+    between, confirmation fails with 409 and this preview must be regenerated,
+    so an old trial timeline can never be applied on top of a newer one.
+    """
     meeting = _get_meeting_or_404(meeting_id)
     if not _is_live(meeting_id):
         raise HTTPException(409, "会议尚未开始录入，没有需要延期消解的冲突")
     suggestion = _build_suggestion(meeting)
     if suggestion["initial_hard_conflict_count"] == 0:
         raise HTTPException(409, "当前没有冲突，无需延期")
+    suggestion["revision"] = meeting["revision"]
     return suggestion
 
 
@@ -267,6 +305,7 @@ def api_preview_postponements(meeting_id: int):
 def api_confirm_postponements(meeting_id: int, body: PostponeIn):
     """Atomically persist the postponement and immediately re-schedule."""
     meeting = _get_meeting_or_404(meeting_id)
+    _ensure_revision(meeting, body.revision)
     if not _is_live(meeting_id):
         raise HTTPException(409, "会议尚未开始录入，不能延期议程")
 
@@ -299,7 +338,11 @@ def api_confirm_postponements(meeting_id: int, body: PostponeIn):
             f"延期后仍超出 {trial['remaining_overflow_minutes']} 分钟，无法确认延期",
         )
 
-    db.postpone_items(meeting_id, ids)
+    # Optimistic concurrency: the revision handed out with the preview is
+    # compared against the current one inside the same transaction that marks
+    # the items and writes the undo record. Any intervening live write
+    # (recording / undo / reset / another postponement) aborts everything.
+    db.postpone_items(meeting_id, ids, body.revision)
     return _build_plan(db.get_meeting(meeting_id))
 
 

@@ -13,6 +13,18 @@ DB_PATH = os.environ.get("AGENDA_DB", os.path.join(os.path.dirname(__file__), ".
 _lock = threading.RLock()
 
 
+class RevisionConflict(Exception):
+    """Raised when a write carries a revision older than the stored one.
+
+    Carries the current (expected) revision so callers can surface it in the
+    409 response and clients can re-sync without an extra round trip.
+    """
+
+    def __init__(self, expected_revision: int):
+        super().__init__(f"revision conflict: expected {expected_revision}")
+        self.expected_revision = expected_revision
+
+
 def get_conn() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -30,6 +42,7 @@ def init_db() -> None:
                 title TEXT NOT NULL,
                 start_time TEXT NOT NULL,
                 end_time TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             );
 
@@ -64,10 +77,37 @@ def init_db() -> None:
             """
         )
         # migrate databases created before the postponement feature
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(items)")}
-        if "postponed" not in cols:
+        item_cols = {r["name"] for r in conn.execute("PRAGMA table_info(items)")}
+        if "postponed" not in item_cols:
             conn.execute(
                 "ALTER TABLE items ADD COLUMN postponed INTEGER NOT NULL DEFAULT 0")
+
+        # migrate databases created before optimistic concurrency control
+        meeting_cols = {r["name"] for r in conn.execute("PRAGMA table_info(meetings)")}
+        if "revision" not in meeting_cols:
+            conn.execute(
+                "ALTER TABLE meetings ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+
+
+def _check_and_bump_revision(conn: sqlite3.Connection, meeting_id: int,
+                             revision: int) -> None:
+    """Compare-and-increment the meeting revision inside the open write txn.
+
+    Raises ``RevisionConflict`` (leaving the transaction to be rolled back)
+    when ``revision`` differs from the value the client read. On success the
+    revision is advanced exactly once, in the same transaction as the actual
+    write, so a stale preview can never overwrite a newer timeline.
+    """
+    row = conn.execute(
+        "SELECT revision FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+    if row is None:
+        raise LookupError("meeting not found")
+    current = int(row["revision"])
+    if revision != current:
+        raise RevisionConflict(current)
+    conn.execute(
+        "UPDATE meetings SET revision = revision + 1 WHERE id = ?",
+        (meeting_id,))
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +226,10 @@ def _push_undo(conn: sqlite3.Connection, meeting_id: int, action: str,
     )
 
 
-def record_actual(meeting_id: int, item_id: int, actual_end: str) -> dict:
+def record_actual(meeting_id: int, item_id: int, actual_end: str,
+                  revision: int) -> dict:
     with _lock, get_conn() as conn:
+        _check_and_bump_revision(conn, meeting_id, revision)
         row = conn.execute("SELECT * FROM items WHERE id = ? AND meeting_id = ?",
                            (item_id, meeting_id)).fetchone()
         if row is None:
@@ -199,7 +241,7 @@ def record_actual(meeting_id: int, item_id: int, actual_end: str) -> dict:
         return dict(conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone())
 
 
-def undo_last(meeting_id: int) -> bool:
+def undo_last(meeting_id: int, revision: int) -> bool:
     """Restore the item states captured by the most recent live entry."""
     with _lock, get_conn() as conn:
         log = conn.execute(
@@ -207,6 +249,7 @@ def undo_last(meeting_id: int) -> bool:
             (meeting_id,)).fetchone()
         if log is None:
             return False
+        _check_and_bump_revision(conn, meeting_id, revision)
         items = json.loads(log["snapshot"])
         for it in items:
             conn.execute(
@@ -219,8 +262,9 @@ def undo_last(meeting_id: int) -> bool:
         return True
 
 
-def reset_actuals(meeting_id: int) -> None:
+def reset_actuals(meeting_id: int, revision: int) -> None:
     with _lock, get_conn() as conn:
+        _check_and_bump_revision(conn, meeting_id, revision)
         snapshot = _snapshot(conn, meeting_id)
         _push_undo(conn, meeting_id, "reset", snapshot)
         conn.execute(
@@ -228,16 +272,20 @@ def reset_actuals(meeting_id: int) -> None:
             (meeting_id,))
 
 
-def postpone_items(meeting_id: int, item_ids: list[int]) -> None:
+def postpone_items(meeting_id: int, item_ids: list[int], revision: int) -> None:
     """Atomically mark items as postponed (deferred out of this meeting).
 
     One undo entry is pushed for the whole batch so a single undo restores
-    every item (and any earlier postponement state) at once.
+    every item (and any earlier postponement state) at once. The revision is
+    verified against the value returned by the postponement preview (or the
+    latest plan) before any write; on mismatch ``RevisionConflict`` aborts the
+    whole transaction.
     """
     if not item_ids:
         raise ValueError("no items to postpone")
     unique_ids = list(dict.fromkeys(item_ids))
     with _lock, get_conn() as conn:
+        _check_and_bump_revision(conn, meeting_id, revision)
         placeholders = ",".join("?" for _ in unique_ids)
         rows = conn.execute(
             f"SELECT id FROM items WHERE meeting_id = ? AND id IN ({placeholders})",

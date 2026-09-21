@@ -7,7 +7,8 @@
 - **冲突明确列出**：即使所有可压缩项都压到最短仍无法容纳时，页面顶部明确列出冲突议程与超出分钟数；
 - **一键生成延期建议**：冲突面板可试排“把低优先级议程移出本次会议”，先预览延期项目与试排时间轴，确认后原子保存并立即重排（可撤销）；
 - **双时间轴对比**：原计划 vs 实时新计划，压缩 / 完成 / 冲突分段着色，并标注当前时刻锚点与会议结束时间；
-- **可撤销**：随时撤销最近一次实况录入（含延期操作，支持逐步撤销），也可一键重置实况。
+- **可撤销**：随时撤销最近一次实况录入（含延期操作，支持逐步撤销），也可一键重置实况；
+- **乐观并发保护**：每个会议维护单调递增的 `revision`，录入实况 / 撤销 / 重置 / 确认延期必须提交读取到的版本，版本不一致返回 `409` 且不写入任何数据；旧的延期预览不能覆盖新时间轴。
 
 技术栈：**FastAPI + SQLite（标准库 sqlite3）+ 原生 HTML/CSS/JavaScript**，无前端构建步骤。
 
@@ -60,7 +61,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    - 固定休息段、已完成项、不可压缩项永远不会被移出；
    - 弹窗列出每一步将延期的项目、释放时长与原因，并展示**试排时间轴**；
    - 若仍有冲突，弹窗明确显示剩余超时分钟数，**“确认延期并重排”按钮禁用**，无法确认；
-   - 确认后延期状态原子写入数据库并立即重排；该操作作为一条记录进入撤销链，点“↩ 撤销最近录入”即可把这些项目恢复回本次会议。
+   - 确认后延期状态原子写入数据库并立即重排；该操作作为一条记录进入撤销链，点“↩ 撤销最近录入”即可把这些项目恢复回本次会议（确认时校验预览的 `revision`，期间计划被他人更新会收到 409，需重新预览）。
    - 已延期的议程在列表中标“⏭ 已延期”，不再参与重排；撤销延期前也不能对其录入实况。
 6. **撤销 / 重置**：点“↩ 撤销最近录入”逐步回退；“重置实况”清除全部实际结束时间与延期状态（重置本身也可撤销）。
 
@@ -95,13 +96,35 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/items/{id}/move` | 上移 / 下移（`{"direction":"up"}`） |
 | POST | `/api/meetings/{id}/breaks` | 添加固定休息段 |
 | DELETE | `/api/breaks/{id}` | 删除休息段 |
-| POST | `/api/meetings/{id}/actuals` | 录入实际结束时间并触发重排 |
-| POST | `/api/meetings/{id}/postponements/preview` | 试排延期建议（不写库）：延期项目、每步原因、剩余超时、试排时间轴 |
-| POST | `/api/meetings/{id}/postponements` | 确认延期（原子保存 + 立即重排，进入撤销链；仍有冲突返回 409） |
-| POST | `/api/meetings/{id}/undo` | 撤销最近一次实况录入 / 延期 |
-| POST | `/api/meetings/{id}/reset` | 重置全部实况与延期状态（可撤销） |
+| POST | `/api/meetings/{id}/actuals` | 录入实际结束时间并触发重排（请求体须带 `revision`） |
+| POST | `/api/meetings/{id}/postponements/preview` | 试排延期建议（不写库）：延期项目、每步原因、剩余超时、试排时间轴、`revision` |
+| POST | `/api/meetings/{id}/postponements` | 确认延期（原子保存 + 立即重排，进入撤销链；请求体须带预览返回的 `revision`；仍有冲突返回 409） |
+| POST | `/api/meetings/{id}/undo` | 撤销最近一次实况录入 / 延期（请求体须带 `revision`） |
+| POST | `/api/meetings/{id}/reset` | 重置全部实况与延期状态（可撤销；请求体须带 `revision`） |
 
 交互式文档：启动后访问 http://localhost:8000/docs 。
+
+## 乐观并发控制（revision）
+
+为避免多个操作员同时录入 / 撤销 / 确认延期时互相覆盖，每个会议维护一个**单调递增的整数 `revision`**，初始为 1：
+
+- `GET /api/meetings/{id}` 的完整计划与 `POST .../postponements/preview` 的延期预览都会在响应顶层返回当前 `revision`（预览不写库，因此不会使版本前进）。
+- 以下写请求必须在 JSON 请求体中提交读取计划（或预览）时得到的 `revision`：
+  - `POST .../actuals`：`{"item_id": …, "actual_end": …, "revision": 3}`
+  - `POST .../undo` / `POST .../reset`：`{"revision": 3}`
+  - `POST .../postponements`：`{"item_ids": […], "revision": 3}`（此处必须是**延期预览返回的版本**）
+- 服务端在**同一个数据库事务内**比较 `revision` 与当前版本：一致才执行写入并把版本加一；不一致则整笔事务回滚，返回 `409 Conflict`，数据保持不变。响应体形如：
+  ```json
+  {
+    "detail": "计划已被其他操作更新（revision 不一致），请刷新计划后重试；若正在确认延期，请重新生成延期预览。",
+    "code": "revision_conflict",
+    "current_revision": 4
+  }
+  ```
+  客户端可直接使用 `current_revision` 重新拉取计划并重试；确认延期前必须**重新调用预览**——前一次操作（录入 / 撤销 / 重置 / 他人确认延期）完成后，旧预览试排出的时间轴已过期，不能再落到新时间轴上。
+- 只有实况写操作会推进 `revision`；会前的议程 / 休息编辑不参与版本号（会议进入实况后这些接口本就被禁用）。
+- 旧版数据库启动时自动迁移：为 `meetings` 表补充 `revision INTEGER NOT NULL DEFAULT 1` 列，已有会议从版本 1 开始。
+- 前端在收到冲突时自动刷新计划、关闭录入 / 延期弹窗、丢弃旧预览，并提示重新生成延期预览。
 
 ## 项目结构
 
@@ -116,7 +139,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 │   ├── index.html     # 单页界面
 │   ├── styles.css
 │   └── app.js         # 原生 JS：双时间轴渲染与交互
-├── tests/             # 算法单元测试 + API 集成测试
+├── tests/             # 算法单元测试 + API 集成测试 + 并发回归测试（tests/test_concurrency.py）
 ├── data/              # 本地运行时的 SQLite 文件（git 忽略）
 ├── Dockerfile
 ├── docker-compose.yml

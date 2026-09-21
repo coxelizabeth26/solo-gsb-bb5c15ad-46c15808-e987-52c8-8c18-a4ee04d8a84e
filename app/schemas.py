@@ -36,6 +36,7 @@ class ItemCreate(BaseModel):
 class ActualIn(BaseModel):
     item_id: int
     actual_end: str
+    revision: int = Field(ge=1, description="读取计划时获得的 revision（乐观并发）")
 
     @field_validator("actual_end")
     @classmethod
@@ -47,8 +48,14 @@ class MoveIn(BaseModel):
     direction: str = Field(pattern="^(up|down)$")
 
 
+class RevisionIn(BaseModel):
+    """Request body carrying the read revision for undo / reset."""
+    revision: int = Field(ge=1, description="读取计划时获得的 revision（乐观并发）")
+
+
 class PostponeIn(BaseModel):
     item_ids: list[int] = Field(min_length=1, max_length=500)
+    revision: int = Field(ge=1, description="延期预览返回的 revision（乐观并发）")
 
 
 class BreakCreate(BaseModel):

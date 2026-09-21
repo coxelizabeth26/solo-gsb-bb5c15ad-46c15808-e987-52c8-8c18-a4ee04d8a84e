@@ -10,6 +10,16 @@ const state = {
 const $ = (sel) => document.querySelector(sel);
 
 // --------------------------------------------------------------------------- utilities
+class ApiError extends Error {
+  constructor(status, data) {
+    super(typeof data?.detail === "string" ? data.detail : "请求失败");
+    this.status = status;
+    this.data = data || {};
+  }
+  get isRevisionConflict() {
+    return this.status === 409 && this.data.code === "revision_conflict";
+  }
+}
 function toDTInput(d) {
   const p = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
@@ -36,7 +46,7 @@ async function api(method, url, body) {
   if (resp.status === 204) return null;
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
-    throw new Error(typeof data.detail === "string" ? data.detail : "请求失败");
+    throw new ApiError(resp.status, data);
   }
   return data;
 }
@@ -459,6 +469,18 @@ async function refresh() {
   renderAll();
 }
 
+// Optimistic concurrency: the server rejected a live write because another
+// client advanced the revision. Re-sync the plan; the stale postponement
+// preview (if open) is discarded and must be regenerated against the new
+// timeline before it can be confirmed again.
+async function handleRevisionConflict() {
+  await refresh();
+  state.suggestion = null;
+  $("#suggestModal").classList.add("hidden");
+  $("#actualModal").classList.add("hidden");
+  toast("计划已被其他人更新，已为你刷新；延期建议请重新生成预览后再确认。", true);
+}
+
 // actual modal
 function openActualModal(itemId, title) {
   $("#actualItemId").value = itemId;
@@ -479,22 +501,27 @@ $("#actualForm").addEventListener("submit", async (e) => {
     state.plan = await api("POST", `/api/meetings/${state.currentId}/actuals`, {
       item_id: Number($("#actualItemId").value),
       actual_end: $("#actualEnd").value,
+      revision: state.plan.revision,
     });
     $("#actualModal").classList.add("hidden");
     renderAll();
     const n = state.plan.current.conflicts.length;
     toast(n ? `已重排：发现 ${n} 项冲突，请查看红色提示` : "已重排，所有议程均可容纳");
   } catch (err) {
+    if (err.isRevisionConflict) return handleRevisionConflict();
     toast(err.message, true);
   }
 });
 
 $("#btnUndo").addEventListener("click", async () => {
   try {
-    state.plan = await api("POST", `/api/meetings/${state.currentId}/undo`);
+    state.plan = await api("POST", `/api/meetings/${state.currentId}/undo`, {
+      revision: state.plan.revision,
+    });
     renderAll();
     toast("已撤销最近一次实况录入");
   } catch (err) {
+    if (err.isRevisionConflict) return handleRevisionConflict();
     toast(err.message, true);
   }
 });
@@ -502,10 +529,13 @@ $("#btnUndo").addEventListener("click", async () => {
 $("#btnReset").addEventListener("click", async () => {
   if (!confirm("确定清除所有实际结束时间？（之后可用撤销恢复）")) return;
   try {
-    state.plan = await api("POST", `/api/meetings/${state.currentId}/reset`);
+    state.plan = await api("POST", `/api/meetings/${state.currentId}/reset`, {
+      revision: state.plan.revision,
+    });
     renderAll();
     toast("已重置实况");
   } catch (err) {
+    if (err.isRevisionConflict) return handleRevisionConflict();
     toast(err.message, true);
   }
 });
@@ -548,7 +578,7 @@ function renderSuggestion(s) {
     body.innerHTML = `
       <p class="hint">以下议程将被移出本次会议（按试排顺序），共 <strong>${s.steps.length}</strong> 项，
         释放计划时长 <strong>${s.steps.reduce((n, st) => n + st.releases_minutes, 0)}</strong> 分钟。
-        本预览不写入数据库。</p>
+        本预览不写入数据库；确认时会校验预览版本（revision ${s.revision}），若期间计划已被更新，需关闭弹窗并重新生成预览。</p>
       <div class="table-wrap">
         <table class="data-table">
           <thead><tr><th>#</th><th>延期项目</th><th>优先级</th><th>释放时长</th><th>移出原因</th></tr></thead>
@@ -596,11 +626,14 @@ $("#btnSuggestConfirm").addEventListener("click", async () => {
   try {
     state.plan = await api("POST", `/api/meetings/${state.currentId}/postponements`, {
       item_ids: s.item_ids,
+      revision: s.revision,
     });
+    state.suggestion = null;
     $("#suggestModal").classList.add("hidden");
     renderAll();
     toast(`已延期 ${s.item_ids.length} 项并完成重排，冲突已清零`);
   } catch (err) {
+    if (err.isRevisionConflict) return handleRevisionConflict();
     $("#btnSuggestConfirm").disabled = false;
     toast(err.message, true);
   }

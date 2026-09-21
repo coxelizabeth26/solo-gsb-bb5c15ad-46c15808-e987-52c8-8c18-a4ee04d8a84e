@@ -13,6 +13,13 @@ DB_PATH = os.environ.get("AGENDA_DB", os.path.join(os.path.dirname(__file__), ".
 _lock = threading.RLock()
 
 
+class RevisionConflict(Exception):
+    """Raised when a write's expected meeting revision does not match the DB.
+
+    The transaction is rolled back, so raising this never changes data.
+    """
+
+
 def get_conn() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -30,7 +37,8 @@ def init_db() -> None:
                 title TEXT NOT NULL,
                 start_time TEXT NOT NULL,
                 end_time TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS items (
@@ -68,6 +76,12 @@ def init_db() -> None:
         if "postponed" not in cols:
             conn.execute(
                 "ALTER TABLE items ADD COLUMN postponed INTEGER NOT NULL DEFAULT 0")
+
+        # migrate databases created before optimistic concurrency (revision)
+        mcols = {r["name"] for r in conn.execute("PRAGMA table_info(meetings)")}
+        if "revision" not in mcols:
+            conn.execute(
+                "ALTER TABLE meetings ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +186,30 @@ def move_item(meeting_id: int, item_id: int, direction: str) -> Optional[list[di
 # actuals (live recording) + undo log
 # ---------------------------------------------------------------------------
 
+def _check_revision(conn: sqlite3.Connection, meeting_id: int,
+                    expected_revision: int) -> None:
+    """Compare the revision inside an open write transaction.
+
+    Mismatches raise ``RevisionConflict``; the caller's transaction is then
+    rolled back so no data changes.
+    """
+    row = conn.execute(
+        "SELECT revision FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+    if row is None:
+        raise LookupError("meeting not found")
+    if row["revision"] != expected_revision:
+        raise RevisionConflict(
+            f"revision mismatch: expected {expected_revision}, "
+            f"current {row['revision']}")
+
+
+def _bump_revision(conn: sqlite3.Connection, meeting_id: int) -> None:
+    """Monotonically increase the meeting revision (call inside a txn)."""
+    conn.execute(
+        "UPDATE meetings SET revision = revision + 1 WHERE id = ?",
+        (meeting_id,))
+
+
 def _snapshot(conn: sqlite3.Connection, meeting_id: int) -> str:
     items = [dict(r) for r in conn.execute(
         "SELECT * FROM items WHERE meeting_id = ? ORDER BY sort_order, id", (meeting_id,))]
@@ -186,69 +224,109 @@ def _push_undo(conn: sqlite3.Connection, meeting_id: int, action: str,
     )
 
 
-def record_actual(meeting_id: int, item_id: int, actual_end: str) -> dict:
+def record_actual(meeting_id: int, item_id: int, actual_end: str,
+                  expected_revision: int) -> dict:
     with _lock, get_conn() as conn:
-        row = conn.execute("SELECT * FROM items WHERE id = ? AND meeting_id = ?",
-                           (item_id, meeting_id)).fetchone()
-        if row is None:
-            raise LookupError("item not found")
-        snapshot = _snapshot(conn, meeting_id)
-        conn.execute("UPDATE items SET actual_end = ? WHERE id = ?",
-                     (actual_end, item_id))
-        _push_undo(conn, meeting_id, "actual", snapshot)
-        return dict(conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone())
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _check_revision(conn, meeting_id, expected_revision)
+            row = conn.execute(
+                "SELECT * FROM items WHERE id = ? AND meeting_id = ?",
+                (item_id, meeting_id)).fetchone()
+            if row is None:
+                raise LookupError("item not found")
+            snapshot = _snapshot(conn, meeting_id)
+            conn.execute("UPDATE items SET actual_end = ? WHERE id = ?",
+                         (actual_end, item_id))
+            _push_undo(conn, meeting_id, "actual", snapshot)
+            _bump_revision(conn, meeting_id)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return dict(conn.execute(
+            "SELECT * FROM items WHERE id = ?", (item_id,)).fetchone())
 
 
-def undo_last(meeting_id: int) -> bool:
+def undo_last(meeting_id: int, expected_revision: int) -> bool:
     """Restore the item states captured by the most recent live entry."""
     with _lock, get_conn() as conn:
-        log = conn.execute(
-            "SELECT * FROM undo_log WHERE meeting_id = ? ORDER BY id DESC LIMIT 1",
-            (meeting_id,)).fetchone()
-        if log is None:
-            return False
-        items = json.loads(log["snapshot"])
-        for it in items:
-            conn.execute(
-                "UPDATE items SET actual_end = ? WHERE id = ? AND meeting_id = ?",
-                (it["actual_end"], it["id"], meeting_id))
-            conn.execute(
-                "UPDATE items SET postponed = ? WHERE id = ? AND meeting_id = ?",
-                (1 if it.get("postponed") else 0, it["id"], meeting_id))
-        conn.execute("DELETE FROM undo_log WHERE id = ?", (log["id"],))
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _check_revision(conn, meeting_id, expected_revision)
+            log = conn.execute(
+                "SELECT * FROM undo_log WHERE meeting_id = ? ORDER BY id DESC LIMIT 1",
+                (meeting_id,)).fetchone()
+            if log is None:
+                # nothing to undo: this is not a mutation, roll back the
+                # revision check so the version is left untouched
+                conn.rollback()
+                return False
+            items = json.loads(log["snapshot"])
+            for it in items:
+                conn.execute(
+                    "UPDATE items SET actual_end = ? WHERE id = ? AND meeting_id = ?",
+                    (it["actual_end"], it["id"], meeting_id))
+                conn.execute(
+                    "UPDATE items SET postponed = ? WHERE id = ? AND meeting_id = ?",
+                    (1 if it.get("postponed") else 0, it["id"], meeting_id))
+            conn.execute("DELETE FROM undo_log WHERE id = ?", (log["id"],))
+            _bump_revision(conn, meeting_id)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         return True
 
 
-def reset_actuals(meeting_id: int) -> None:
+def reset_actuals(meeting_id: int, expected_revision: int) -> None:
     with _lock, get_conn() as conn:
-        snapshot = _snapshot(conn, meeting_id)
-        _push_undo(conn, meeting_id, "reset", snapshot)
-        conn.execute(
-            "UPDATE items SET actual_end = NULL, postponed = 0 WHERE meeting_id = ?",
-            (meeting_id,))
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _check_revision(conn, meeting_id, expected_revision)
+            snapshot = _snapshot(conn, meeting_id)
+            _push_undo(conn, meeting_id, "reset", snapshot)
+            conn.execute(
+                "UPDATE items SET actual_end = NULL, postponed = 0 WHERE meeting_id = ?",
+                (meeting_id,))
+            _bump_revision(conn, meeting_id)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
-def postpone_items(meeting_id: int, item_ids: list[int]) -> None:
+def postpone_items(meeting_id: int, item_ids: list[int],
+                   expected_revision: int) -> None:
     """Atomically mark items as postponed (deferred out of this meeting).
 
     One undo entry is pushed for the whole batch so a single undo restores
-    every item (and any earlier postponement state) at once.
+    every item (and any earlier postponement state) at once. The revision is
+    compared and bumped inside the same write transaction.
     """
     if not item_ids:
         raise ValueError("no items to postpone")
     unique_ids = list(dict.fromkeys(item_ids))
     with _lock, get_conn() as conn:
-        placeholders = ",".join("?" for _ in unique_ids)
-        rows = conn.execute(
-            f"SELECT id FROM items WHERE meeting_id = ? AND id IN ({placeholders})",
-            (meeting_id, *unique_ids)).fetchall()
-        if len(rows) != len(unique_ids):
-            raise LookupError("some items not found")
-        snapshot = _snapshot(conn, meeting_id)
-        conn.execute(
-            f"UPDATE items SET postponed = 1 WHERE meeting_id = ? AND id IN ({placeholders})",
-            (meeting_id, *unique_ids))
-        _push_undo(conn, meeting_id, "postpone", snapshot)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _check_revision(conn, meeting_id, expected_revision)
+            placeholders = ",".join("?" for _ in unique_ids)
+            rows = conn.execute(
+                f"SELECT id FROM items WHERE meeting_id = ? AND id IN ({placeholders})",
+                (meeting_id, *unique_ids)).fetchall()
+            if len(rows) != len(unique_ids):
+                raise LookupError("some items not found")
+            snapshot = _snapshot(conn, meeting_id)
+            conn.execute(
+                f"UPDATE items SET postponed = 1 WHERE meeting_id = ? AND id IN ({placeholders})",
+                (meeting_id, *unique_ids))
+            _push_undo(conn, meeting_id, "postpone", snapshot)
+            _bump_revision(conn, meeting_id)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def undo_count(meeting_id: int) -> int:

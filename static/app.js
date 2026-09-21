@@ -36,9 +36,27 @@ async function api(method, url, body) {
   if (resp.status === 204) return null;
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
-    throw new Error(typeof data.detail === "string" ? data.detail : "请求失败");
+    const detail = data.detail;
+    const err = new Error(
+      typeof detail === "string" ? detail
+        : (detail && typeof detail.message === "string") ? detail.message
+        : "请求失败");
+    err.status = resp.status;
+    err.code = detail && typeof detail === "object" ? detail.code : null;
+    throw err;
   }
   return data;
+}
+
+// 409 + revision_conflict: another client/action advanced the timeline.
+function isStaleRevision(err) {
+  return err && err.status === 409 && err.code === "revision_conflict";
+}
+
+// Reload the plan after a stale-write conflict so the UI shows the newest
+// revision; callers guide the user to redo their action (or re-preview).
+async function refreshAfterConflict() {
+  await refresh();
 }
 
 async function loadMeetings(selectId) {
@@ -479,22 +497,30 @@ $("#actualForm").addEventListener("submit", async (e) => {
     state.plan = await api("POST", `/api/meetings/${state.currentId}/actuals`, {
       item_id: Number($("#actualItemId").value),
       actual_end: $("#actualEnd").value,
+      revision: state.plan.revision,
     });
     $("#actualModal").classList.add("hidden");
     renderAll();
     const n = state.plan.current.conflicts.length;
     toast(n ? `已重排：发现 ${n} 项冲突，请查看红色提示` : "已重排，所有议程均可容纳");
   } catch (err) {
+    if (isStaleRevision(err)) {
+      $("#actualModal").classList.add("hidden");
+      await refreshAfterConflict();
+    }
     toast(err.message, true);
   }
 });
 
 $("#btnUndo").addEventListener("click", async () => {
   try {
-    state.plan = await api("POST", `/api/meetings/${state.currentId}/undo`);
+    state.plan = await api("POST", `/api/meetings/${state.currentId}/undo`, {
+      revision: state.plan.revision,
+    });
     renderAll();
     toast("已撤销最近一次实况录入");
   } catch (err) {
+    if (isStaleRevision(err)) await refreshAfterConflict();
     toast(err.message, true);
   }
 });
@@ -502,10 +528,13 @@ $("#btnUndo").addEventListener("click", async () => {
 $("#btnReset").addEventListener("click", async () => {
   if (!confirm("确定清除所有实际结束时间？（之后可用撤销恢复）")) return;
   try {
-    state.plan = await api("POST", `/api/meetings/${state.currentId}/reset`);
+    state.plan = await api("POST", `/api/meetings/${state.currentId}/reset`, {
+      revision: state.plan.revision,
+    });
     renderAll();
     toast("已重置实况");
   } catch (err) {
+    if (isStaleRevision(err)) await refreshAfterConflict();
     toast(err.message, true);
   }
 });
@@ -596,13 +625,24 @@ $("#btnSuggestConfirm").addEventListener("click", async () => {
   try {
     state.plan = await api("POST", `/api/meetings/${state.currentId}/postponements`, {
       item_ids: s.item_ids,
+      // revision captured together with this preview; a stale preview can
+      // never overwrite a timeline that moved on
+      revision: s.revision,
     });
     $("#suggestModal").classList.add("hidden");
+    state.suggestion = null;
     renderAll();
     toast(`已延期 ${s.item_ids.length} 项并完成重排，冲突已清零`);
   } catch (err) {
-    $("#btnSuggestConfirm").disabled = false;
-    toast(err.message, true);
+    if (isStaleRevision(err)) {
+      $("#suggestModal").classList.add("hidden");
+      state.suggestion = null;
+      await refreshAfterConflict();
+      toast(err.message + " 请重新生成延期建议。", true);
+    } else {
+      $("#btnSuggestConfirm").disabled = false;
+      toast(err.message, true);
+    }
   }
 });
 

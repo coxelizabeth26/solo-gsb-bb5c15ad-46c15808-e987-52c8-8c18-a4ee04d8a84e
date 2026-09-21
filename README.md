@@ -89,19 +89,41 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | GET | `/api/meetings` | 会议列表 |
 | POST | `/api/meetings` | 创建会议 |
-| GET | `/api/meetings/{id}` | 会议完整计划（items / breaks / 原计划 / 新计划 / 冲突） |
+| GET | `/api/meetings/{id}` | 会议完整计划（items / breaks / 原计划 / 新计划 / 冲突 / **revision**） |
 | POST | `/api/meetings/{id}/items` | 添加议程项 |
 | DELETE | `/api/items/{id}` | 删除议程项 |
 | POST | `/api/items/{id}/move` | 上移 / 下移（`{"direction":"up"}`） |
 | POST | `/api/meetings/{id}/breaks` | 添加固定休息段 |
 | DELETE | `/api/breaks/{id}` | 删除休息段 |
-| POST | `/api/meetings/{id}/actuals` | 录入实际结束时间并触发重排 |
-| POST | `/api/meetings/{id}/postponements/preview` | 试排延期建议（不写库）：延期项目、每步原因、剩余超时、试排时间轴 |
-| POST | `/api/meetings/{id}/postponements` | 确认延期（原子保存 + 立即重排，进入撤销链；仍有冲突返回 409） |
-| POST | `/api/meetings/{id}/undo` | 撤销最近一次实况录入 / 延期 |
-| POST | `/api/meetings/{id}/reset` | 重置全部实况与延期状态（可撤销） |
+| POST | `/api/meetings/{id}/actuals` | 录入实际结束时间并触发重排（提交 `revision`） |
+| POST | `/api/meetings/{id}/postponements/preview` | 试排延期建议（不写库）：延期项目、每步原因、剩余超时、试排时间轴、**revision** |
+| POST | `/api/meetings/{id}/postponements` | 确认延期（提交预览返回的 `revision`；原子保存 + 立即重排，进入撤销链；版本不一致或仍有冲突返回 409） |
+| POST | `/api/meetings/{id}/undo` | 撤销最近一次实况录入 / 延期（提交 `revision`） |
+| POST | `/api/meetings/{id}/reset` | 重置全部实况与延期状态（提交 `revision`，可撤销） |
 
 交互式文档：启动后访问 http://localhost:8000/docs 。
+
+### 乐观并发（revision）
+
+会议进行中可能有多个标签页 / 操作员同时操作，因此每个会议维护一个**单调递增的 `revision`**，对实况时间轴采用乐观并发控制：
+
+- `GET /api/meetings/{id}` 的返回中带有当前 `revision`；延期预览接口（只读、不写库）同样在返回中盖上生成该试排时的 `revision`。
+- 录入实况（`actuals`）、撤销（`undo`）、重置（`reset`）、确认延期（`postponements`）的请求体必须带 `revision`（非负整数），值取自最近一次读取到的计划 / 预览：
+
+  ```json
+  { "...": "各接口原有字段", "revision": 3 }
+  ```
+
+- 服务端在**同一个 `BEGIN IMMEDIATE` 写事务内**先比较 `revision`，再写入，成功后把该会议的 `revision` 原子 `+1`；比较失败时事务整体回滚，**不改变任何数据**，返回 `409 Conflict`：
+
+  ```json
+  { "detail": { "code": "revision_conflict",
+                "message": "计划已被其他操作更新（版本不一致）……" } }
+  ```
+
+- 确认延期时校验的是**预览产生的那个 `revision`**：预览确认前若已有其他实况操作（录入 / 撤销 / 重置 / 另一笔延期）改变了时间轴，旧预览的确认必然 409，旧试排结果不可能覆盖新时间轴；冲突后需要重新调用预览接口。
+- 前端在 409 冲突提示中会自动重新拉取最新计划；延期确认冲突时关闭旧预览弹窗并引导重新生成延期建议。
+- 撤销链为空时撤销返回 `404` 且不改变 `revision`；议程编辑 / 休息段编辑只允许在未开始录入时进行，不参与 `revision`。旧版 SQLite 数据库首次启动会自动迁移补上 `revision` 列（默认 0）。
 
 ## 项目结构
 

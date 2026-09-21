@@ -36,6 +36,8 @@ class ItemCreate(BaseModel):
 class ActualIn(BaseModel):
     item_id: int
     actual_end: str
+    # optimistic-concurrency token read from the latest plan/preview
+    revision: int = Field(ge=0)
 
     @field_validator("actual_end")
     @classmethod
@@ -47,8 +49,15 @@ class MoveIn(BaseModel):
     direction: str = Field(pattern="^(up|down)$")
 
 
+class RevisionIn(BaseModel):
+    """Body for live-state mutations guarded by optimistic concurrency."""
+    revision: int = Field(ge=0)
+
+
 class PostponeIn(BaseModel):
     item_ids: list[int] = Field(min_length=1, max_length=500)
+    # must match the revision returned together with the confirmed preview
+    revision: int = Field(ge=0)
 
 
 class BreakCreate(BaseModel):

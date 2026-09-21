@@ -15,6 +15,7 @@ from .scheduler import (
 )
 from .schemas import (
     ActualIn, BreakCreate, ItemCreate, MeetingCreate, MoveIn, PostponeIn,
+    RevisionIn,
 )
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -27,7 +28,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="会议议程实时重排", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="会议议程实时重排", version="1.1.0", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +66,7 @@ def _build_plan(meeting: dict) -> dict:
         "breaks": breaks,
         "live": live,
         "anchor": current["anchor"],
+        "revision": meeting["revision"],
         "undo_count": db.undo_count(meeting["id"]),
         "original": original,
         "current": current,
@@ -76,6 +78,11 @@ def _get_meeting_or_404(meeting_id: int) -> dict:
     if meeting is None:
         raise HTTPException(404, "会议不存在")
     return meeting
+
+
+def _revision_conflict(message: str) -> HTTPException:
+    """409 carrying a machine-readable code so the UI can refresh/retry."""
+    return HTTPException(409, {"code": "revision_conflict", "message": message})
 
 
 def _is_live(meeting_id: int) -> bool:
@@ -93,7 +100,12 @@ def _build_suggestion(meeting: dict) -> dict:
     breaks = db.list_breaks(meeting["id"])
     start = parse_dt(meeting["start_time"])
     end = parse_dt(meeting["end_time"])
-    return suggest_postponements(start, end, items, breaks, _live_anchor(items))
+    suggestion = suggest_postponements(
+        start, end, items, breaks, _live_anchor(items))
+    # The preview is read-only: it stamps the current revision so the later
+    # confirmation can prove the trial timeline is still up to date.
+    suggestion["revision"] = meeting["revision"]
+    return suggestion
 
 
 # ---------------------------------------------------------------------------
@@ -226,24 +238,38 @@ def api_record_actual(meeting_id: int, body: ActualIn):
         if actual < anchor:
             raise HTTPException(422, f"实际结束时间不能早于上一议程结束时间 {anchor.strftime('%H:%M')}")
 
-    db.record_actual(meeting_id, body.item_id, body.actual_end)
+    try:
+        db.record_actual(meeting_id, body.item_id, body.actual_end,
+                         body.revision)
+    except db.RevisionConflict:
+        raise _revision_conflict(
+            "计划已被其他操作更新（版本不一致），已刷新计划，请核对后重新录入。")
     return _build_plan(db.get_meeting(meeting_id))
 
 
 @app.post("/api/meetings/{meeting_id}/undo")
-def api_undo(meeting_id: int):
+def api_undo(meeting_id: int, body: RevisionIn):
     _get_meeting_or_404(meeting_id)
-    if not db.undo_last(meeting_id):
+    try:
+        undone = db.undo_last(meeting_id, body.revision)
+    except db.RevisionConflict:
+        raise _revision_conflict(
+            "计划已被其他操作更新（版本不一致），已刷新计划，请重新撤销。")
+    if not undone:
         raise HTTPException(404, "没有可撤销的实况录入")
     return _build_plan(db.get_meeting(meeting_id))
 
 
 @app.post("/api/meetings/{meeting_id}/reset")
-def api_reset(meeting_id: int):
+def api_reset(meeting_id: int, body: RevisionIn):
     _get_meeting_or_404(meeting_id)
     if not _is_live(meeting_id):
         raise HTTPException(409, "当前没有任何实况录入")
-    db.reset_actuals(meeting_id)
+    try:
+        db.reset_actuals(meeting_id, body.revision)
+    except db.RevisionConflict:
+        raise _revision_conflict(
+            "计划已被其他操作更新（版本不一致），已刷新计划，请重新重置。")
     return _build_plan(db.get_meeting(meeting_id))
 
 
@@ -299,7 +325,14 @@ def api_confirm_postponements(meeting_id: int, body: PostponeIn):
             f"延期后仍超出 {trial['remaining_overflow_minutes']} 分钟，无法确认延期",
         )
 
-    db.postpone_items(meeting_id, ids)
+    # The committed revision must match the one stamped on the preview the
+    # user actually saw: any intervening live operation invalidates the old
+    # trial timeline so it can never overwrite the new plan.
+    try:
+        db.postpone_items(meeting_id, ids, body.revision)
+    except db.RevisionConflict:
+        raise _revision_conflict(
+            "延期预览基于旧版本，会议计划已被其他操作更新，已刷新计划，请重新生成延期建议。")
     return _build_plan(db.get_meeting(meeting_id))
 
 

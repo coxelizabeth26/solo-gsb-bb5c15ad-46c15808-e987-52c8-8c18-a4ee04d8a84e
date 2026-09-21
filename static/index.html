@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>会议议程实时重排</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🕒</span>
+      <div>
+        <h1>会议议程实时重排</h1>
+        <p class="subtitle">固定休息不动 · 按优先级压缩 · 冲突一目了然</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <select id="meetingSelect" title="切换会议"></select>
+      <button class="btn btn-secondary" id="btnNewMeeting">＋ 新会议</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- Setup view -->
+    <section id="setupView" class="card hidden">
+      <h2>创建会议</h2>
+      <form id="meetingForm" class="form-grid">
+        <label class="span2">
+          会议标题
+          <input type="text" id="mTitle" placeholder="例如：季度规划评审会" required>
+        </label>
+        <label>
+          开始时间
+          <input type="datetime-local" id="mStart" required>
+        </label>
+        <label>
+          结束时间
+          <input type="datetime-local" id="mEnd" required>
+        </label>
+        <div class="span2 form-actions">
+          <button type="submit" class="btn btn-primary">创建并进入会议</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Meeting view -->
+    <div id="meetingView" class="hidden">
+      <!-- summary bar -->
+      <section class="card meeting-bar">
+        <div>
+          <h2 id="mvTitle"></h2>
+          <p class="muted" id="mvTime"></p>
+        </div>
+        <div class="meeting-bar-actions">
+          <span id="liveBadge" class="badge badge-off">未开始录入</span>
+          <button class="btn btn-warn" id="btnUndo" disabled>↩ 撤销最近录入</button>
+          <button class="btn btn-secondary" id="btnReset" disabled>重置实况</button>
+        </div>
+      </section>
+
+      <!-- conflicts -->
+      <section id="conflictPanel" class="card hidden"></section>
+
+      <!-- entry forms -->
+      <div class="two-col">
+        <section class="card">
+          <h3>添加议程项</h3>
+          <form id="itemForm">
+            <label>标题<input type="text" id="iTitle" placeholder="例如：项目进展汇报" required></label>
+            <div class="form-row">
+              <label>计划时长（分钟）<input type="number" id="iPlanned" min="1" value="20" required></label>
+              <label>最短时长（分钟）<input type="number" id="iMin" min="0" value="10" required></label>
+            </div>
+            <div class="form-row">
+              <label>优先级
+                <select id="iPriority">
+                  <option value="1">1 - 最低</option>
+                  <option value="2">2</option>
+                  <option value="3" selected>3 - 普通</option>
+                  <option value="4">4</option>
+                  <option value="5">5 - 最高</option>
+                </select>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="iIncompressible">
+                不可压缩
+              </label>
+            </div>
+            <p class="hint" id="itemHint">可压缩议程在超时后按优先级从低到高压缩，且不会低于最短时长。</p>
+            <button type="submit" class="btn btn-primary btn-block">添加议程</button>
+          </form>
+        </section>
+
+        <section class="card">
+          <h3>添加固定休息段</h3>
+          <form id="breakForm">
+            <label>标题<input type="text" id="bTitle" placeholder="例如：茶歇"></label>
+            <div class="form-row">
+              <label>固定开始时间<input type="datetime-local" id="bStart" required></label>
+              <label>时长（分钟）<input type="number" id="bDuration" min="1" value="10" required></label>
+            </div>
+            <p class="hint">固定休息段在重排时始终保持原时间，不移动。</p>
+            <button type="submit" class="btn btn-primary btn-block">添加休息段</button>
+          </form>
+        </section>
+      </div>
+
+      <!-- agenda & breaks lists -->
+      <div class="two-col">
+        <section class="card">
+          <h3>议程列表 <span class="count" id="itemCount"></span></h3>
+          <div class="table-wrap">
+            <table class="data-table" id="itemTable">
+              <thead>
+                <tr>
+                  <th>#</th><th>标题</th><th>计划</th><th>最短</th><th>优先级</th>
+                  <th>属性</th><th>实际结束</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="card">
+          <h3>固定休息段 <span class="count" id="breakCount"></span></h3>
+          <div class="table-wrap">
+            <table class="data-table" id="breakTable">
+              <thead>
+                <tr><th>标题</th><th>开始</th><th>时长</th><th>操作</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <!-- timelines -->
+      <section class="card">
+        <h3>双时间轴对比</h3>
+        <div class="legend">
+          <span><i class="sw sw-planned"></i>计划 / 未压缩</span>
+          <span><i class="sw sw-compressed"></i>已压缩</span>
+          <span><i class="sw sw-completed"></i>已完成（实际）</span>
+          <span><i class="sw sw-break"></i>固定休息</span>
+          <span><i class="sw sw-conflict"></i>冲突 / 超时</span>
+          <span><i class="sw sw-now"></i>当前时刻（锚点）</span>
+        </div>
+
+        <div class="timeline-block">
+          <div class="timeline-head">
+            <h4>📋 原计划</h4>
+            <span class="muted" id="origEnd"></span>
+          </div>
+          <div class="timeline" id="originalTimeline"></div>
+        </div>
+
+        <div class="timeline-block">
+          <div class="timeline-head">
+            <h4>⚡ 新计划（实时重排）</h4>
+            <span class="muted" id="currEnd"></span>
+          </div>
+          <div class="timeline" id="currentTimeline"></div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <!-- actual-end modal -->
+  <div id="actualModal" class="modal-backdrop hidden">
+    <div class="modal">
+      <h3>录入实际结束时间</h3>
+      <p id="modalItemTitle" class="muted"></p>
+      <form id="actualForm">
+        <input type="hidden" id="actualItemId">
+        <label>该项实际结束于
+          <input type="datetime-local" id="actualEnd" required>
+        </label>
+        <p class="hint">提交后，系统将从该时刻向后重排所有未完成议程。</p>
+        <div class="form-actions">
+          <button type="button" class="btn btn-secondary" id="cancelActual">取消</button>
+          <button type="submit" class="btn btn-primary">提交并重排</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- postponement-suggestion modal -->
+  <div id="suggestModal" class="modal-backdrop hidden">
+    <div class="modal modal-wide">
+      <h3>生成延期建议（试排预览）</h3>
+      <p class="muted">仅针对未完成且可压缩的议程，从最早冲突开始反复试排；固定休息、已完成与不可压缩项不会被移出。</p>
+      <div id="suggestBody"></div>
+      <div id="suggestStatus"></div>
+      <div class="trial-timeline-wrap">
+        <h4>试排时间轴（确认后生效）</h4>
+        <div class="timeline" id="suggestTimeline"></div>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn btn-secondary" id="cancelSuggest">取消</button>
+        <button type="button" class="btn btn-primary" id="btnSuggestConfirm" disabled>确认延期并重排</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

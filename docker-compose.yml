@@ -1,0 +1,13 @@
+services:
+  agenda:
+    build: .
+    image: meeting-agenda:latest
+    container_name: meeting-agenda
+    ports:
+      - "8000:8000"
+    volumes:
+      - agenda-data:/data
+    restart: unless-stopped
+
+volumes:
+  agenda-data:
